@@ -226,6 +226,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Whether to group threads in the agent panel sidebar by linked git
+    /// worktree, rendering a worktree subsection header (with branch and a
+    /// "+" button) under each project section.
+    ///
+    /// Default: false
+    pub group_threads_by_worktree: Option<bool>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

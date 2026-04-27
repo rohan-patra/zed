@@ -11,6 +11,7 @@ use project::{DisableAiSettings, Project};
 use remote::RemoteConnectionOptions;
 use settings::Settings;
 pub use settings::SidebarSide;
+use std::collections::HashSet;
 use std::future::Future;
 
 use std::path::PathBuf;
@@ -274,6 +275,7 @@ pub struct ProjectGroup {
 pub struct SerializedProjectGroupState {
     pub key: ProjectGroupKey,
     pub expanded: bool,
+    pub collapsed_worktrees: Vec<PathList>,
 }
 
 #[derive(Clone)]
@@ -281,6 +283,10 @@ pub struct ProjectGroupState {
     pub key: ProjectGroupKey,
     pub expanded: bool,
     pub last_active_workspace: Option<WeakEntity<Workspace>>,
+    /// Folder paths of worktree subsections the user has collapsed within
+    /// this project group. Used by the agent sidebar's
+    /// `group_threads_by_worktree` setting; persisted across restarts.
+    pub collapsed_worktrees: HashSet<PathList>,
 }
 
 pub struct MultiWorkspace {
@@ -636,6 +642,7 @@ impl MultiWorkspace {
                 key,
                 expanded: true,
                 last_active_workspace: None,
+                collapsed_worktrees: HashSet::new(),
             },
         );
     }
@@ -771,7 +778,12 @@ impl MultiWorkspace {
         _cx: &mut Context<Self>,
     ) {
         let mut restored: Vec<ProjectGroupState> = Vec::new();
-        for SerializedProjectGroupState { key, expanded } in groups {
+        for SerializedProjectGroupState {
+            key,
+            expanded,
+            collapsed_worktrees,
+        } in groups
+        {
             if key.path_list().paths().is_empty() {
                 continue;
             }
@@ -782,6 +794,7 @@ impl MultiWorkspace {
                 key,
                 expanded,
                 last_active_workspace: None,
+                collapsed_worktrees: collapsed_worktrees.into_iter().collect(),
             });
         }
         for existing in std::mem::take(&mut self.project_groups) {
@@ -841,6 +854,39 @@ impl MultiWorkspace {
         self.project_groups
             .iter_mut()
             .find(|group| group.key == *key)
+    }
+
+    /// Whether the worktree subsection identified by `folder_paths` (the
+    /// folder-path portion of a `WorktreePaths`) within the given project
+    /// group is currently collapsed.
+    pub fn is_worktree_collapsed(
+        &self,
+        project_key: &ProjectGroupKey,
+        folder_paths: &PathList,
+    ) -> bool {
+        self.group_state_by_key(project_key)
+            .is_some_and(|group| group.collapsed_worktrees.contains(folder_paths))
+    }
+
+    /// Sets the collapsed state of a worktree subsection within a project
+    /// group and persists the change.
+    pub fn set_worktree_collapsed(
+        &mut self,
+        project_key: &ProjectGroupKey,
+        folder_paths: &PathList,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(group) = self.group_state_by_key_mut(project_key) {
+            let changed = if collapsed {
+                group.collapsed_worktrees.insert(folder_paths.clone())
+            } else {
+                group.collapsed_worktrees.remove(folder_paths)
+            };
+            if changed {
+                self.serialize(cx);
+            }
+        }
     }
 
     pub fn set_all_groups_expanded(&mut self, expanded: bool) {
@@ -1544,9 +1590,12 @@ impl MultiWorkspace {
                             .project_groups
                             .iter()
                             .map(|group| {
+                                let collapsed: Vec<PathList> =
+                                    group.collapsed_worktrees.iter().cloned().collect();
                                 crate::persistence::model::SerializedProjectGroup::from_group(
                                     &group.key,
                                     group.expanded,
+                                    &collapsed,
                                 )
                             })
                             .collect::<Vec<_>>(),
@@ -1744,6 +1793,7 @@ impl MultiWorkspace {
             key: group.key,
             expanded: group.expanded,
             last_active_workspace: None,
+            collapsed_worktrees: HashSet::new(),
         });
     }
 

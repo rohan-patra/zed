@@ -130,6 +130,7 @@ fn assert_remote_project_integration_sidebar_state(
                     "expected the only sidebar project header to be `project`"
                 );
             }
+            ListEntry::WorktreeHeader { .. } => {}
             ListEntry::Thread(thread)
                 if thread.metadata.session_id.as_ref() == Some(main_thread_id) =>
             {
@@ -493,6 +494,19 @@ fn visible_entries_as_strings(
                             "v"
                         };
                         format!("{} [{}]{}", icon, label, selected)
+                    }
+                    ListEntry::WorktreeHeader {
+                        label,
+                        branch,
+                        is_collapsed,
+                        ..
+                    } => {
+                        let branch_str = branch
+                            .as_ref()
+                            .map(|b| format!(" ({b})"))
+                            .unwrap_or_default();
+                        let icon = if *is_collapsed { ">" } else { "v" };
+                        format!("  {} [{}]{}{}", icon, label, branch_str, selected)
                     }
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
@@ -3851,6 +3865,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         "expected the only sidebar project header to be `project`"
                     );
                 }
+                ListEntry::WorktreeHeader { .. } => {}
                 ListEntry::Thread(thread)
                     if thread.metadata.title.as_ref().map(|t| t.as_ref()) == Some("WT Thread")
                         && thread
@@ -11203,5 +11218,223 @@ async fn test_cmd_click_project_header_returns_to_last_active_linked_worktree_wo
         active_after_cmd_click, main_workspace_a,
         "cmd-click must not fall back to the main-paths workspace when a \
          linked-worktree workspace was the last-active one for the group"
+    );
+}
+
+fn enable_group_threads_by_worktree(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+) {
+    use gpui::UpdateGlobal as _;
+    cx.update(|_, cx| {
+        settings::SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "group_threads_by_worktree": true } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+    });
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_group_threads_by_worktree_setting_off_keeps_flat_list(cx: &mut TestAppContext) {
+    let (project, _fs) = init_test_project_with_git("/project", cx).await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_named_thread_metadata("main-t", "Main Thread", &project, cx).await;
+    save_thread_metadata_with_main_paths(
+        "wt-t",
+        "WT Thread",
+        PathList::new(&[PathBuf::from("/wt/feature")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 1).unwrap(),
+        cx,
+    );
+
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  WT Thread {feature}",
+            "  Main Thread",
+        ],
+        "with the setting off, threads should be flat-listed under the project header"
+    );
+}
+
+#[gpui::test]
+async fn test_group_threads_by_worktree_setting_on_emits_subsection_headers(
+    cx: &mut TestAppContext,
+) {
+    let (project, _fs) = init_test_project_with_git("/project", cx).await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_named_thread_metadata("main-t", "Main Thread", &project, cx).await;
+    save_thread_metadata_with_main_paths(
+        "wt-a",
+        "Feature A Thread",
+        PathList::new(&[PathBuf::from("/wt/feature-a")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 1).unwrap(),
+        cx,
+    );
+    save_thread_metadata_with_main_paths(
+        "wt-b",
+        "Feature B Thread",
+        PathList::new(&[PathBuf::from("/wt/feature-b")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 2).unwrap(),
+        cx,
+    );
+
+    enable_group_threads_by_worktree(&sidebar, cx);
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  v [feature-b]",
+            "  Feature B Thread",
+            "  v [feature-a]",
+            "  Feature A Thread",
+            "  v [project]",
+            "  Main Thread",
+        ],
+        "with the setting on, each unique worktree should get its own subsection \
+         header and per-thread worktree chips should be hidden"
+    );
+}
+
+#[gpui::test]
+async fn test_group_threads_by_worktree_skips_empty_buckets(cx: &mut TestAppContext) {
+    let (project, _fs) = init_test_project_with_git("/project", cx).await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    // Only the linked worktree has a thread; the main worktree has none.
+    save_thread_metadata_with_main_paths(
+        "wt-only",
+        "Only WT Thread",
+        PathList::new(&[PathBuf::from("/wt/feature")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 1).unwrap(),
+        cx,
+    );
+
+    enable_group_threads_by_worktree(&sidebar, cx);
+
+    // No header should be emitted for the empty main worktree bucket.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  v [feature]",
+            "  Only WT Thread",
+        ],
+        "worktrees with no threads must not get a subsection header"
+    );
+}
+
+#[gpui::test]
+async fn test_group_threads_by_worktree_collapse_toggle(cx: &mut TestAppContext) {
+    let (project, _fs) = init_test_project_with_git("/project", cx).await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_named_thread_metadata("main-t", "Main Thread", &project, cx).await;
+    save_thread_metadata_with_main_paths(
+        "wt-t",
+        "WT Thread",
+        PathList::new(&[PathBuf::from("/wt/feature")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 1).unwrap(),
+        cx,
+    );
+
+    enable_group_threads_by_worktree(&sidebar, cx);
+
+    let project_key = project.read_with(cx, |p, cx| p.project_group_key(cx));
+    let feature_paths = PathList::new(&[PathBuf::from("/wt/feature")]);
+
+    // Both buckets start expanded.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  v [feature]",
+            "  WT Thread",
+            "  v [project]",
+            "  Main Thread",
+        ],
+        "buckets should default to expanded"
+    );
+
+    // Collapse the feature worktree bucket.
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.toggle_worktree_collapsed(&project_key, &feature_paths, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  > [feature]",
+            "  v [project]",
+            "  Main Thread",
+        ],
+        "collapsing a worktree subsection should hide its threads while \
+         leaving other buckets unchanged"
+    );
+
+    // Toggle back to expanded.
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.toggle_worktree_collapsed(&project_key, &feature_paths, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [project]",
+            "  v [feature]",
+            "  WT Thread",
+            "  v [project]",
+            "  Main Thread",
+        ],
+        "toggling again should re-expand the bucket"
     );
 }

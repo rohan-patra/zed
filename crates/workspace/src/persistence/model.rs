@@ -68,6 +68,12 @@ pub struct SerializedProjectGroup {
     pub(crate) location: SerializedWorkspaceLocation,
     #[serde(default = "default_expanded")]
     pub expanded: bool,
+    /// Folder paths of worktree subsections the user has collapsed within
+    /// this project group. Each entry is a serialized [`PathList`]. Empty by
+    /// default for backward compatibility with persisted state written before
+    /// the worktree-grouping feature existed.
+    #[serde(default)]
+    pub collapsed_worktrees: Vec<SerializedPathList>,
 }
 
 fn default_expanded() -> bool {
@@ -75,7 +81,11 @@ fn default_expanded() -> bool {
 }
 
 impl SerializedProjectGroup {
-    pub fn from_group(key: &ProjectGroupKey, expanded: bool) -> Self {
+    pub fn from_group(
+        key: &ProjectGroupKey,
+        expanded: bool,
+        collapsed_worktrees: &[PathList],
+    ) -> Self {
         Self {
             path_list: key.path_list().serialize(),
             location: match key.host() {
@@ -83,6 +93,10 @@ impl SerializedProjectGroup {
                 None => SerializedWorkspaceLocation::Local,
             },
             expanded,
+            collapsed_worktrees: collapsed_worktrees
+                .iter()
+                .map(|paths| paths.serialize())
+                .collect(),
         }
     }
 
@@ -92,9 +106,15 @@ impl SerializedProjectGroup {
             SerializedWorkspaceLocation::Local => None,
             SerializedWorkspaceLocation::Remote(opts) => Some(opts),
         };
+        let collapsed_worktrees = self
+            .collapsed_worktrees
+            .into_iter()
+            .map(|serialized| PathList::deserialize(&serialized))
+            .collect();
         SerializedProjectGroupState {
             key: ProjectGroupKey::new(host, path_list),
             expanded: self.expanded,
+            collapsed_worktrees,
         }
     }
 }

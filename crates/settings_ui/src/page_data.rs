@@ -7691,6 +7691,24 @@ fn ai_page(cx: &App) -> SettingsPage {
                 metadata: None,
                 files: USER,
             }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Group Threads By Worktree",
+                description: "Whether to group threads in the agent panel sidebar by linked git worktree, rendering a worktree subsection header (with branch and a \"+\" button) under each project section.",
+                field: Box::new(SettingField {
+                    json_path: Some("agent.group_threads_by_worktree"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.group_threads_by_worktree.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .group_threads_by_worktree = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
         ]);
 
         items.into_boxed_slice()

@@ -1203,6 +1203,12 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Whether to group threads in the agent panel sidebar by linked git
+    // worktree, rendering a worktree subsection header (with branch and a
+    // "+" button) under each project section.
+    //
+    // Default: false
+    "group_threads_by_worktree": false,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,
