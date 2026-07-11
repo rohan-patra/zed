@@ -606,6 +606,7 @@ mod tests {
             sandbox_permissions: Default::default(),
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
+            group_threads_by_worktree: false,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
         }

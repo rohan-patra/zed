@@ -52,6 +52,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::SystemTime;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
@@ -116,6 +117,7 @@ enum SerializedSidebarView {
 #[derive(Clone, Copy)]
 enum NewEntryTarget {
     LastCreatedKind,
+    Thread,
     Terminal,
 }
 
@@ -400,6 +402,22 @@ enum ListEntry {
         is_active: bool,
         has_threads: bool,
     },
+    WorktreeHeader {
+        project_key: ProjectGroupKey,
+        /// The folder paths of this worktree bucket — used to open the
+        /// matching workspace from the header's "+" button when no open
+        /// workspace currently has these as roots.
+        folder_paths: PathList,
+        label: SharedString,
+        branch: Option<SharedString>,
+        workspace: Option<WeakEntity<Workspace>>,
+        is_collapsed: bool,
+        /// Aggregated status of this worktree's threads, surfaced on the header
+        /// while the worktree is collapsed so the information stays accessible.
+        has_running_threads: bool,
+        waiting_thread_count: usize,
+        has_notifications: bool,
+    },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
 }
@@ -427,7 +445,7 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => None,
         }
     }
 
@@ -469,7 +487,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_)
+            | ListEntry::ProjectHeader { .. }
+            | ListEntry::WorktreeHeader { .. } => None,
         }
     }
 
@@ -489,6 +509,11 @@ impl ListEntry {
             },
             ListEntry::ProjectHeader { key, .. } => multi_workspace
                 .workspaces_for_project_group(key, cx)
+                .unwrap_or_default(),
+            ListEntry::WorktreeHeader { workspace, .. } => workspace
+                .as_ref()
+                .and_then(|ws| ws.upgrade())
+                .map(|ws| vec![ws])
                 .unwrap_or_default(),
         }
     }
@@ -528,6 +553,7 @@ enum EntryShape {
         // `!is_collapsed && !has_threads`).
         is_collapsed: bool,
     },
+    WorktreeHeader(PathList),
     Thread(ThreadId),
     Terminal(TerminalId),
 }
@@ -608,6 +634,351 @@ fn workspace_has_terminal_metadata_except(
         .read(cx)
         .entries_for_path(&path_list, remote_connection.as_ref())
         .any(|terminal| except_terminal_id != Some(terminal.terminal_id))
+}
+
+/// Result of probing a worktree checkout's on-disk state. Cached on the
+/// sidebar keyed by the worktree's absolute checkout path.
+#[derive(Clone, Copy, PartialEq)]
+enum WorktreeCreatedAt {
+    /// A probe is in flight; treat as present with unknown creation time.
+    Pending,
+    /// The checkout directory was confirmed absent on disk, so its worktree
+    /// subsection is hidden.
+    Missing,
+    /// The checkout is present. `Some` carries the creation time of the git
+    /// worktree registration, used to order subsections most-recent-first;
+    /// `None` when that timestamp was unavailable.
+    Present(Option<SystemTime>),
+}
+
+/// One worktree to render as a subsection under a project group, resolved from
+/// the group's open repositories (git's worktree list) plus the group's main
+/// worktree. Worktrees confirmed deleted from disk are excluded upstream.
+struct GroupWorktree {
+    /// Folder path list used to key the subsection and match thread buckets.
+    folder_paths: PathList,
+    /// Synthesized paths driving the header's label and branch lookup.
+    worktree_paths: WorktreePaths,
+    /// The project's own root worktree (rendered first).
+    is_main: bool,
+    /// Git-registration creation time; `None` sorts after timestamped ones.
+    created_at: Option<SystemTime>,
+}
+
+/// Enumerate the worktrees to render for a project group when
+/// `group_threads_by_worktree` is on: the group's main worktree first, then
+/// each linked worktree reported by git for the group's open repositories,
+/// ordered most-recently-created first. Worktrees whose checkout is known to be
+/// missing on disk are omitted and their folder paths returned separately so
+/// their thread buckets can also be suppressed.
+fn compute_group_worktrees(
+    worktree_created_at: &HashMap<PathBuf, WorktreeCreatedAt>,
+    group_key: &ProjectGroupKey,
+    group_workspaces: &[Entity<Workspace>],
+    cx: &App,
+) -> (Vec<GroupWorktree>, HashSet<PathList>) {
+    let main_paths = group_key.path_list().clone();
+    let mut worktrees = vec![GroupWorktree {
+        folder_paths: main_paths.clone(),
+        worktree_paths: WorktreePaths::from_folder_paths(&main_paths),
+        is_main: true,
+        created_at: None,
+    }];
+    let mut hidden_folders: HashSet<PathList> = HashSet::new();
+    let mut seen: HashSet<PathList> = HashSet::from_iter([main_paths]);
+
+    for workspace in group_workspaces {
+        let project = workspace.read(cx).project().read(cx);
+        for repo in project.repositories(cx).values() {
+            let snapshot = repo.read(cx).snapshot();
+            let repo_main = snapshot.work_directory_abs_path.to_path_buf();
+            let repo_main_paths = PathList::new(&[repo_main]);
+            for linked in snapshot.linked_worktrees() {
+                let folder_paths = PathList::new(std::slice::from_ref(&linked.path));
+                if !seen.insert(folder_paths.clone()) {
+                    continue;
+                }
+                match worktree_created_at.get(&linked.path) {
+                    Some(WorktreeCreatedAt::Missing) => {
+                        hidden_folders.insert(folder_paths);
+                        continue;
+                    }
+                    Some(WorktreeCreatedAt::Present(created_at)) => {
+                        let Ok(worktree_paths) = WorktreePaths::from_path_lists(
+                            repo_main_paths.clone(),
+                            folder_paths.clone(),
+                        ) else {
+                            continue;
+                        };
+                        worktrees.push(GroupWorktree {
+                            folder_paths,
+                            worktree_paths,
+                            is_main: false,
+                            created_at: *created_at,
+                        });
+                    }
+                    Some(WorktreeCreatedAt::Pending) | None => {
+                        let Ok(worktree_paths) = WorktreePaths::from_path_lists(
+                            repo_main_paths.clone(),
+                            folder_paths.clone(),
+                        ) else {
+                            continue;
+                        };
+                        worktrees.push(GroupWorktree {
+                            folder_paths,
+                            worktree_paths,
+                            is_main: false,
+                            created_at: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Main worktree first, then linked worktrees most-recently-created first.
+    // Un-probed worktrees (no timestamp yet) sort after timestamped ones and
+    // fall back to a stable path ordering.
+    worktrees.sort_by(|a, b| {
+        b.is_main
+            .cmp(&a.is_main)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.folder_paths.paths().cmp(b.folder_paths.paths()))
+    });
+
+    (worktrees, hidden_folders)
+}
+
+/// Emit a worktree subsection header for `folder`, followed by the bucketed
+/// terminals and threads for that folder (removed from `bucket_by_folder`).
+/// Per-entry worktree chips are cleared since the header already identifies the
+/// worktree. Respects the user's per-worktree collapse state (ignored during
+/// search so matches stay visible).
+#[allow(clippy::too_many_arguments)]
+fn emit_worktree_subsection(
+    entries: &mut Vec<ListEntry>,
+    bucket_by_folder: &mut HashMap<PathList, (WorktreePaths, Vec<TerminalEntry>, Vec<Arc<ThreadEntry>>)>,
+    group_key: &ProjectGroupKey,
+    worktree_paths: &WorktreePaths,
+    folder: &PathList,
+    has_query: bool,
+    collapsed_worktrees: Option<&HashSet<PathList>>,
+    group_workspaces: &[Entity<Workspace>],
+    branch_by_path: &HashMap<PathBuf, SharedString>,
+    notified_threads: &HashSet<agent_ui::ThreadId>,
+    notified_terminals: &HashSet<TerminalId>,
+    current_session_ids: &mut HashSet<acp::SessionId>,
+    current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
+    cx: &App,
+) {
+    let bucket_collapsed =
+        !has_query && collapsed_worktrees.is_some_and(|set| set.contains(folder));
+
+    // Aggregate the bucket's live status so a collapsed worktree can still
+    // surface running/waiting/unread indicators on its header, mirroring the
+    // project header.
+    let mut has_running_threads = false;
+    let mut waiting_thread_count = 0;
+    let mut has_notifications = false;
+    if let Some((_, bucket_terminals, bucket_threads)) = bucket_by_folder.get(folder) {
+        for thread in bucket_threads {
+            match thread.status {
+                AgentThreadStatus::Running => has_running_threads = true,
+                AgentThreadStatus::WaitingForConfirmation => waiting_thread_count += 1,
+                _ => {}
+            }
+            if notified_threads.contains(&thread.metadata.thread_id) {
+                has_notifications = true;
+            }
+        }
+        if !has_notifications {
+            has_notifications = bucket_terminals
+                .iter()
+                .any(|terminal| notified_terminals.contains(&terminal.metadata.terminal_id));
+        }
+    }
+
+    entries.push(make_worktree_header_entry(
+        group_key,
+        worktree_paths,
+        group_workspaces,
+        branch_by_path,
+        bucket_collapsed,
+        has_running_threads,
+        waiting_thread_count,
+        has_notifications,
+        cx,
+    ));
+    let bucket = bucket_by_folder.remove(folder);
+    if bucket_collapsed {
+        // The bucket's rows aren't emitted while collapsed, so mark their ids
+        // "current" here; otherwise `notified_threads`/`thread_last_accessed`
+        // would be purged on rebuild and the header's notification indicator
+        // would disappear.
+        if let Some((_, _, bucket_threads)) = &bucket {
+            for thread in bucket_threads {
+                if let Some(session_id) = &thread.metadata.session_id {
+                    current_session_ids.insert(session_id.clone());
+                }
+                current_thread_ids.insert(thread.metadata.thread_id);
+            }
+        }
+        return;
+    }
+    if let Some((_, bucket_terminals, bucket_threads)) = bucket {
+        // Each entry is now under its worktree's subsection header, so the
+        // per-entry worktree chips would be redundant.
+        let bucket_threads = bucket_threads
+            .into_iter()
+            .map(|mut thread| {
+                Arc::make_mut(&mut thread).worktrees.clear();
+                thread
+            })
+            .collect();
+        let bucket_terminals = bucket_terminals
+            .into_iter()
+            .map(|mut terminal| {
+                terminal.worktrees.clear();
+                terminal
+            })
+            .collect();
+        Sidebar::push_entries_by_display_time(
+            entries,
+            bucket_terminals,
+            bucket_threads,
+            current_session_ids,
+            current_thread_ids,
+        );
+    }
+}
+
+/// Horizontal padding added to the left of a chat row's content when threads are
+/// grouped by worktree, indenting it beneath its worktree subsection header. The
+/// row itself stays full-width (see [`nest_under_worktree`]) so its selection and
+/// hover highlight span the whole panel like every other row.
+const WORKTREE_NEST_INDENT: Pixels = px(16.);
+
+/// When threads are grouped by worktree, every chat row sits beneath a worktree
+/// subsection header. Draw a subtle vertical guide rail as an overlay to the left
+/// of the (already indented) row content — using the shared `panel_indent_guide`
+/// color, like other nested lists in the app — to tie each chat to its worktree.
+/// The rail is an overlay rather than a leading column so the row's highlight
+/// still fills the full panel width. When the setting is off the row is returned
+/// unchanged.
+fn nest_under_worktree(row: AnyElement, cx: &App) -> AnyElement {
+    if !AgentSettings::get_global(cx).group_threads_by_worktree {
+        return row;
+    }
+    div()
+        .relative()
+        .w_full()
+        .child(row)
+        .child(
+            div()
+                .absolute()
+                .left(px(9.))
+                .top_0()
+                .bottom_0()
+                .w(px(1.))
+                .bg(cx.theme().colors().panel_indent_guide),
+        )
+        .into_any_element()
+}
+
+/// Bucket the given threads and terminals by their full `WorktreePaths`,
+/// preserving the first-seen order of each bucket in display-time order
+/// (most recent first), returning a list of
+/// `(worktree_paths, terminals_in_bucket, threads_in_bucket)` triples.
+fn bucket_entries_by_worktree(
+    terminals: Vec<TerminalEntry>,
+    threads: Vec<Arc<ThreadEntry>>,
+) -> Vec<(WorktreePaths, Vec<TerminalEntry>, Vec<Arc<ThreadEntry>>)> {
+    enum Entry {
+        Thread(Arc<ThreadEntry>),
+        Terminal(TerminalEntry),
+    }
+
+    impl Entry {
+        fn worktree_paths(&self) -> &WorktreePaths {
+            match self {
+                Entry::Thread(thread) => &thread.metadata.worktree_paths,
+                Entry::Terminal(terminal) => &terminal.metadata.worktree_paths,
+            }
+        }
+
+        fn display_time(&self) -> DateTime<Utc> {
+            match self {
+                Entry::Thread(thread) if thread.draft == Some(DraftKind::Empty) => {
+                    DateTime::<Utc>::MAX_UTC
+                }
+                Entry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
+                Entry::Terminal(terminal) => terminal.metadata.created_at,
+            }
+        }
+    }
+
+    let sorted_entries = terminals
+        .into_iter()
+        .map(Entry::Terminal)
+        .chain(threads.into_iter().map(Entry::Thread))
+        .sorted_by_key(|entry| std::cmp::Reverse(entry.display_time()));
+
+    let mut buckets: Vec<(WorktreePaths, Vec<TerminalEntry>, Vec<Arc<ThreadEntry>>)> = Vec::new();
+    for entry in sorted_entries {
+        let index = match buckets
+            .iter()
+            .position(|(paths, ..)| paths == entry.worktree_paths())
+        {
+            Some(i) => i,
+            None => {
+                buckets.push((entry.worktree_paths().clone(), Vec::new(), Vec::new()));
+                buckets.len() - 1
+            }
+        };
+        match entry {
+            Entry::Thread(thread) => buckets[index].2.push(thread),
+            Entry::Terminal(terminal) => buckets[index].1.push(terminal),
+        }
+    }
+    buckets
+}
+
+/// Build a `ListEntry::WorktreeHeader` for a bucket of threads sharing the
+/// same `WorktreePaths`. Resolves the open workspace whose root paths match
+/// the bucket's folder paths so the header's "+" button can route a new
+/// thread there directly.
+fn make_worktree_header_entry(
+    project_key: &ProjectGroupKey,
+    worktree_paths: &WorktreePaths,
+    group_workspaces: &[Entity<Workspace>],
+    branch_by_path: &HashMap<PathBuf, SharedString>,
+    is_collapsed: bool,
+    has_running_threads: bool,
+    waiting_thread_count: usize,
+    has_notifications: bool,
+    cx: &App,
+) -> ListEntry {
+    let infos = worktree_info_from_thread_paths(worktree_paths, branch_by_path);
+    let label = infos
+        .first()
+        .and_then(|info| info.worktree_name.clone())
+        .unwrap_or_else(|| SharedString::from("worktree"));
+    let branch = infos.first().and_then(|info| info.branch_name.clone());
+    let workspace = group_workspaces
+        .iter()
+        .find(|ws| workspace_path_list(ws, cx) == *worktree_paths.folder_path_list())
+        .map(|ws| ws.downgrade());
+    ListEntry::WorktreeHeader {
+        project_key: project_key.clone(),
+        folder_paths: worktree_paths.folder_path_list().clone(),
+        label,
+        branch,
+        workspace,
+        is_collapsed,
+        has_running_threads,
+        waiting_thread_count,
+        has_notifications,
+    }
 }
 
 #[derive(Clone)]
@@ -811,6 +1182,17 @@ pub struct Sidebar {
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
+    /// Per-worktree-checkout probe of on-disk existence and git-registration
+    /// creation time, keyed by the worktree's absolute checkout path. Populated
+    /// asynchronously (see `prefetch_worktree_created_at`) and consulted while
+    /// building worktree subsections to order them (most recently created
+    /// first) and to hide worktrees whose checkout was deleted from disk. Only
+    /// used when the `group_threads_by_worktree` setting is on.
+    worktree_created_at: HashMap<PathBuf, WorktreeCreatedAt>,
+    /// Worktree checkout paths with an in-flight `worktree_created_at` probe,
+    /// so probes are not issued in duplicate and re-validation keeps showing
+    /// the last known value until the fresh one lands.
+    worktree_created_at_in_flight: HashSet<PathBuf>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
@@ -949,6 +1331,8 @@ impl Sidebar {
             project_header_new_thread_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
+            worktree_created_at: HashMap::new(),
+            worktree_created_at_in_flight: HashSet::new(),
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -981,6 +1365,25 @@ impl Sidebar {
                 mw.serialize(cx);
             });
         }
+    }
+
+    /// Toggles the collapse state of a worktree subsection within a project
+    /// group. Only used when the `group_threads_by_worktree` setting is on.
+    /// State is persisted on the owning [`MultiWorkspace`] alongside the
+    /// project-group expanded flag, so it survives restarts.
+    fn toggle_worktree_collapsed(
+        &mut self,
+        project_key: &ProjectGroupKey,
+        folder_paths: &PathList,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mw) = self.multi_workspace.upgrade() {
+            mw.update(cx, |mw, cx| {
+                let now_collapsed = !mw.is_worktree_collapsed(project_key, folder_paths);
+                mw.set_worktree_collapsed(project_key, folder_paths, now_collapsed, cx);
+            });
+        }
+        self.update_entries(cx);
     }
 
     fn is_active_workspace(&self, workspace: &Entity<Workspace>, cx: &App) -> bool {
@@ -1324,11 +1727,33 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let path_list = project_group_key.path_list().clone();
+        self.open_workspace_at_paths_and_create_draft(
+            path_list,
+            project_group_key,
+            target,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens (or activates) a workspace at the given paths and creates a new
+    /// draft entry there. Unlike [`open_workspace_and_create_entry`], the
+    /// caller chooses the exact path list — useful when targeting a specific
+    /// linked worktree (whose paths differ from the project group's main
+    /// paths).
+    fn open_workspace_at_paths_and_create_draft(
+        &mut self,
+        path_list: PathList,
+        project_group_key: &ProjectGroupKey,
+        target: NewEntryTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
 
-        let path_list = project_group_key.path_list().clone();
         let host = project_group_key.host();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
@@ -1351,6 +1776,7 @@ impl Sidebar {
             let workspace = task.await?;
             this.update_in(cx, |this, window, cx| match target {
                 NewEntryTarget::LastCreatedKind => this.create_new_entry(&workspace, window, cx),
+                NewEntryTarget::Thread => this.create_new_thread(&workspace, window, cx),
                 NewEntryTarget::Terminal => this.create_new_terminal(&workspace, window, cx),
             })?;
             anyhow::Ok(())
@@ -1846,6 +2272,125 @@ impl Sidebar {
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
+            let group_threads_by_worktree =
+                AgentSettings::get_global(cx).group_threads_by_worktree;
+            let group_state = mw.group_state_by_key(group_key);
+            let collapsed_worktrees: Option<&HashSet<PathList>> =
+                group_state.map(|state| &state.collapsed_worktrees);
+
+            // Enumerate all of the group's worktrees up front (main worktree
+            // plus git's linked-worktree list) so subsections appear even for
+            // worktrees with no threads, ordered most-recently-created first,
+            // with worktrees deleted from disk excluded.
+            let (group_worktrees, hidden_worktree_folders) = if group_threads_by_worktree {
+                compute_group_worktrees(
+                    &self.worktree_created_at,
+                    group_key,
+                    group_workspaces,
+                    cx,
+                )
+            } else {
+                (Vec::new(), HashSet::new())
+            };
+
+            let emit_threads = |entries: &mut Vec<ListEntry>,
+                                    terminals: Vec<TerminalEntry>,
+                                    threads: Vec<Arc<ThreadEntry>>,
+                                    current_session_ids: &mut HashSet<acp::SessionId>,
+                                    current_thread_ids: &mut HashSet<agent_ui::ThreadId>| {
+                if !group_threads_by_worktree {
+                    Self::push_entries_by_display_time(
+                        entries,
+                        terminals,
+                        threads,
+                        current_session_ids,
+                        current_thread_ids,
+                    );
+                    return;
+                }
+
+                let has_query = !query.is_empty();
+
+                // Bucket entries by their worktree folder, merging buckets that
+                // share a folder and remembering first-seen (recency) order.
+                let mut bucket_by_folder: HashMap<
+                    PathList,
+                    (WorktreePaths, Vec<TerminalEntry>, Vec<Arc<ThreadEntry>>),
+                > = HashMap::new();
+                let mut folder_recency_order: Vec<PathList> = Vec::new();
+                for (worktree_paths, bucket_terminals, bucket_threads) in
+                    bucket_entries_by_worktree(terminals, threads)
+                {
+                    let folder = worktree_paths.folder_path_list().clone();
+                    match bucket_by_folder.entry(folder.clone()) {
+                        std::collections::hash_map::Entry::Occupied(mut existing) => {
+                            let existing = existing.get_mut();
+                            existing.1.extend(bucket_terminals);
+                            existing.2.extend(bucket_threads);
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            folder_recency_order.push(folder);
+                            slot.insert((worktree_paths, bucket_terminals, bucket_threads));
+                        }
+                    }
+                }
+
+                let mut emitted: HashSet<PathList> = HashSet::new();
+
+                // Enumerated worktrees first (main, then most-recently-created),
+                // shown even when they have no threads yet.
+                for worktree in &group_worktrees {
+                    emit_worktree_subsection(
+                        entries,
+                        &mut bucket_by_folder,
+                        group_key,
+                        &worktree.worktree_paths,
+                        &worktree.folder_paths,
+                        has_query,
+                        collapsed_worktrees,
+                        group_workspaces,
+                        &branch_by_path,
+                        &notified_threads,
+                        &notified_terminals,
+                        current_session_ids,
+                        current_thread_ids,
+                        cx,
+                    );
+                    emitted.insert(worktree.folder_paths.clone());
+                }
+
+                // Any remaining buckets are threads whose worktree git no longer
+                // lists (e.g. a project with no open workspace to enumerate
+                // from). Show them in recency order, but never resurrect a
+                // worktree that was confirmed deleted from disk.
+                for folder in &folder_recency_order {
+                    if emitted.contains(folder) || hidden_worktree_folders.contains(folder) {
+                        continue;
+                    }
+                    let Some((worktree_paths, ..)) = bucket_by_folder.get(folder) else {
+                        continue;
+                    };
+                    let worktree_paths = worktree_paths.clone();
+                    emit_worktree_subsection(
+                        entries,
+                        &mut bucket_by_folder,
+                        group_key,
+                        &worktree_paths,
+                        folder,
+                        has_query,
+                        collapsed_worktrees,
+                        group_workspaces,
+                        &branch_by_path,
+                        &notified_threads,
+                        &notified_terminals,
+                        current_session_ids,
+                        current_thread_ids,
+                        cx,
+                    );
+                    emitted.insert(folder.clone());
+                }
+            };
+
             if !query.is_empty() {
                 let workspace_highlight_positions =
                     fuzzy_match_positions(&query, &label).unwrap_or_default();
@@ -1927,7 +2472,7 @@ impl Sidebar {
                     has_threads,
                 });
 
-                Self::push_entries_by_display_time(
+                emit_threads(
                     &mut entries,
                     matched_terminals,
                     matched_threads,
@@ -1977,7 +2522,7 @@ impl Sidebar {
                     continue;
                 }
 
-                Self::push_entries_by_display_time(
+                emit_threads(
                     &mut entries,
                     terminals,
                     threads,
@@ -2044,6 +2589,7 @@ impl Sidebar {
         self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx));
 
         self.prefetch_worktree_default_branches(cx);
+        self.prefetch_worktree_created_at(cx);
 
         if had_notifications != self.has_notifications(cx) {
             multi_workspace.update(cx, |_, cx| {
@@ -2099,6 +2645,9 @@ impl Sidebar {
                     .map(|state| !state.expanded)
                     .unwrap_or(false),
             },
+            ListEntry::WorktreeHeader { folder_paths, .. } => {
+                EntryShape::WorktreeHeader(folder_paths.clone())
+            }
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
         })
@@ -2248,9 +2797,37 @@ impl Sidebar {
                     cx,
                 )
             }
-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
+            ListEntry::WorktreeHeader {
+                project_key,
+                folder_paths,
+                label,
+                branch,
+                workspace,
+                is_collapsed,
+                has_running_threads,
+                waiting_thread_count,
+                has_notifications,
+            } => self.render_worktree_header(
+                ix,
+                project_key,
+                folder_paths,
+                label,
+                branch.as_ref(),
+                workspace.as_ref(),
+                *is_collapsed,
+                is_selected,
+                *has_running_threads,
+                *waiting_thread_count,
+                *has_notifications,
+                cx,
+            ),
+            ListEntry::Thread(thread) => {
+                let row = self.render_thread(ix, thread, is_active, is_selected, cx);
+                nest_under_worktree(row, cx)
+            }
             ListEntry::Terminal(terminal) => {
-                self.render_terminal(ix, terminal, is_active, is_selected, cx)
+                let row = self.render_terminal(ix, terminal, is_active, is_selected, cx);
+                nest_under_worktree(row, cx)
             }
         };
 
@@ -2800,6 +3377,310 @@ impl Sidebar {
             .ok();
         })
         .detach();
+    }
+
+    // Probes the on-disk existence and creation time of every linked-worktree
+    // subsection currently rendered, so `compute_group_worktrees` can order
+    // worktrees most-recently-created first and drop ones deleted from disk.
+    // Runs off the entry list produced by the last rebuild, re-validating every
+    // rendered worktree so that a checkout created or deleted on disk (even
+    // without a git command, which is why we can't rely solely on git events)
+    // is reflected on the next rebuild without reopening the panel. The last
+    // known value keeps rendering until the fresh probe lands, a probe already
+    // in flight is not duplicated, and a rebuild is only triggered when the
+    // value actually changes, so re-validation neither flashes nor loops. The
+    // main worktree is skipped (its existence is represented by the project
+    // group itself).
+    fn prefetch_worktree_created_at(&mut self, cx: &mut Context<Self>) {
+        if !AgentSettings::get_global(cx).group_threads_by_worktree {
+            return;
+        }
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let mut to_probe: Vec<(ProjectGroupKey, PathBuf, bool)> = Vec::new();
+        for entry in &self.contents.entries {
+            let ListEntry::WorktreeHeader {
+                project_key,
+                folder_paths,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            // Worktree checkouts are single-root; the main worktree shares the
+            // project group's path list and is not probed here.
+            let paths = folder_paths.paths();
+            if paths.len() != 1 || folder_paths == project_key.path_list() {
+                continue;
+            }
+            let path = &paths[0];
+            // Don't stack a second probe on a checkout already being probed.
+            if self.worktree_created_at_in_flight.contains(path) {
+                continue;
+            }
+            let already_probed = self.worktree_created_at.contains_key(path);
+            to_probe.push((project_key.clone(), path.clone(), already_probed));
+        }
+
+        for (project_key, path, already_probed) in to_probe {
+            let Some(repository) = multi_workspace
+                .read(cx)
+                .workspaces_for_project_group(&project_key, cx)
+                .and_then(|workspaces| workspaces.first().cloned())
+                .and_then(|workspace| {
+                    workspace.read(cx).project().read(cx).active_repository(cx)
+                })
+            else {
+                continue;
+            };
+            let request =
+                repository.update(cx, |repository, _| repository.worktree_created_at(path.clone()));
+            // Only seed `Pending` for a first-time probe; a re-validation keeps
+            // showing the last known value until the fresh result arrives.
+            if !already_probed {
+                self.worktree_created_at
+                    .insert(path.clone(), WorktreeCreatedAt::Pending);
+            }
+            self.worktree_created_at_in_flight.insert(path.clone());
+            cx.spawn(async move |this, cx| {
+                let result = request.await;
+                this.update(cx, |sidebar, cx| {
+                    sidebar.worktree_created_at_in_flight.remove(&path);
+                    let state = match result {
+                        Ok(Ok(Some(created_at))) => WorktreeCreatedAt::Present(Some(created_at)),
+                        Ok(Ok(None)) => WorktreeCreatedAt::Missing,
+                        // A stat error or cancelled probe should not hide the
+                        // worktree; show it with an unknown creation time.
+                        Ok(Err(_)) | Err(_) => WorktreeCreatedAt::Present(None),
+                    };
+                    let changed = sidebar.worktree_created_at.get(&path) != Some(&state);
+                    sidebar.worktree_created_at.insert(path, state);
+                    if changed {
+                        sidebar.update_entries(cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn render_worktree_header(
+        &self,
+        ix: usize,
+        project_key: &ProjectGroupKey,
+        folder_paths: &PathList,
+        label: &SharedString,
+        branch: Option<&SharedString>,
+        workspace: Option<&WeakEntity<Workspace>>,
+        is_collapsed: bool,
+        is_focused: bool,
+        has_running_threads: bool,
+        waiting_thread_count: usize,
+        has_notifications: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = SharedString::from(format!("worktree-header-{ix}"));
+        let group_name = SharedString::from(format!("worktree-header-group-{ix}"));
+        let color = cx.theme().colors();
+        let focus_handle = self.focus_handle.clone();
+        let project_key_for_plus = project_key.clone();
+        let folder_paths_for_plus = folder_paths.clone();
+        let workspace_for_plus = workspace.cloned();
+        let project_key_for_toggle = project_key.clone();
+        let folder_paths_for_toggle = folder_paths.clone();
+
+        let disclosure_icon = if is_collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+
+        let sidebar_base_bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
+        let base_bg = color.background.blend(sidebar_base_bg);
+        let hover_base = color
+            .element_active
+            .blend(color.element_background.opacity(0.2));
+        let hover_solid = base_bg.blend(hover_base);
+
+        let group_name_for_gradient = group_name.clone();
+        let gradient_overlay = move || {
+            GradientFade::new(base_bg, hover_solid, hover_solid)
+                .width(px(64.0))
+                .right(px(-2.0))
+                .gradient_stop(0.75)
+                .group_name(group_name_for_gradient.clone())
+        };
+
+        h_flex()
+            .id(id)
+            .group(&group_name)
+            .cursor_pointer()
+            .relative()
+            .min_h(Tab::content_height(cx))
+            .py_1()
+            .w_full()
+            .pl_2()
+            .pr_1p5()
+            .items_center()
+            .justify_between()
+            .border_1()
+            .map(|this| {
+                if is_focused {
+                    this.border_color(color.border_focused)
+                } else {
+                    this.border_color(gpui::transparent_black())
+                }
+            })
+            .hover(|s| s.bg(hover_solid))
+            .child(
+                h_flex()
+                    .relative()
+                    .min_w_0()
+                    .w_full()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::GitWorktree)
+                            .size(IconSize::XSmall)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        // Fill the remaining row width so the branch line can
+                        // use it all; otherwise the column shrinks to the
+                        // worktree name and truncates the branch to that width.
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(label.clone())
+                                            .color(Color::Default)
+                                            .truncate(),
+                                    )
+                                    // When collapsed, surface the worktree's live
+                                    // status on the header so it stays accessible
+                                    // without expanding, mirroring the project header.
+                                    .when(is_collapsed, |this| {
+                                        this.when(has_running_threads, |this| {
+                                            this.child(
+                                                Icon::new(IconName::LoadCircle)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted)
+                                                    .with_rotate_animation(2),
+                                            )
+                                        })
+                                        .when(waiting_thread_count > 0, |this| {
+                                            let tooltip_text = if waiting_thread_count == 1 {
+                                                "1 thread is waiting for confirmation".to_string()
+                                            } else {
+                                                format!(
+                                                    "{waiting_thread_count} threads are waiting for confirmation",
+                                                )
+                                            };
+                                            this.child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "worktree-waiting-indicator-{ix}"
+                                                    )))
+                                                    .child(
+                                                        Icon::new(IconName::Warning)
+                                                            .size(IconSize::XSmall)
+                                                            .color(Color::Warning),
+                                                    )
+                                                    .tooltip(Tooltip::text(tooltip_text)),
+                                            )
+                                        })
+                                        .when(
+                                            has_notifications
+                                                && !has_running_threads
+                                                && waiting_thread_count == 0,
+                                            |this| {
+                                                this.child(
+                                                    Icon::new(IconName::Circle)
+                                                        .size(IconSize::Small)
+                                                        .color(Color::Accent),
+                                                )
+                                            },
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .when(!is_focused && !is_collapsed, |this| {
+                                                this.visible_on_hover(&group_name)
+                                            })
+                                            .child(
+                                                Icon::new(disclosure_icon)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                    ),
+                            )
+                            // Branch on its own line: branch names get long and
+                            // don't reliably fit beside the worktree name.
+                            .when_some(branch.cloned(), |this, branch| {
+                                this.child(
+                                    Label::new(branch)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                            }),
+                    ),
+            )
+            .child(gradient_overlay())
+            .child(
+                h_flex()
+                    .child(gradient_overlay())
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("worktree-header-new-thread-{ix}")),
+                            IconName::Plus,
+                        )
+                        .icon_size(IconSize::Small)
+                        .visible_on_hover(&group_name)
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(
+                                "Start New Agent Thread in This Worktree",
+                                &NewThread,
+                                &focus_handle,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_group_expanded(&project_key_for_plus, true, cx);
+                            this.selection = None;
+                            let workspace =
+                                workspace_for_plus.as_ref().and_then(|ws| ws.upgrade());
+                            if let Some(workspace) = workspace {
+                                this.create_new_thread(&workspace, window, cx);
+                            } else {
+                                this.open_workspace_at_paths_and_create_draft(
+                                    folder_paths_for_plus.clone(),
+                                    &project_key_for_plus,
+                                    NewEntryTarget::Thread,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.toggle_worktree_collapsed(
+                    &project_key_for_toggle,
+                    &folder_paths_for_toggle,
+                    cx,
+                );
+            }))
+            .into_any_element()
     }
 
     fn render_project_header_ellipsis_menu(
@@ -3562,6 +4443,19 @@ impl Sidebar {
                 let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
             }
+            ListEntry::WorktreeHeader {
+                project_key,
+                workspace,
+                ..
+            } => {
+                let project_key = project_key.clone();
+                let workspace = workspace.as_ref().and_then(|ws| ws.upgrade());
+                if let Some(workspace) = workspace {
+                    self.activate_workspace(&workspace, window, cx);
+                } else {
+                    self.activate_or_open_workspace_for_group(&project_key, window, cx);
+                }
+            }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
                 match &thread.workspace {
@@ -4319,6 +5213,13 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
+            Some(ListEntry::WorktreeHeader { project_key, .. }) => {
+                let key = project_key.clone();
+                if !self.is_group_collapsed(&key, cx) {
+                    self.set_group_expanded(&key, false, cx);
+                    self.update_entries(cx);
+                }
+            }
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
@@ -4346,7 +5247,11 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
+            Some(
+                ListEntry::WorktreeHeader { .. }
+                | ListEntry::Thread(_)
+                | ListEntry::Terminal(_),
+            ) => (0..ix).rev().find(|&i| {
                 matches!(
                     self.contents.entries.get(i),
                     Some(ListEntry::ProjectHeader { .. })
@@ -5886,7 +6791,9 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {
+                    unreachable!()
+                }
             }
         }
 
@@ -5944,6 +6851,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::WorktreeHeader { .. } => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -6328,8 +7236,12 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
+        let group_by_worktree = AgentSettings::get_global(cx).group_threads_by_worktree;
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .when(group_by_worktree, |this| {
+                this.leading_indent(WORKTREE_NEST_INDENT)
+            })
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
@@ -6661,8 +7573,12 @@ impl Sidebar {
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
 
+        let group_by_worktree = AgentSettings::get_global(cx).group_threads_by_worktree;
         ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
+            .when(group_by_worktree, |this| {
+                this.leading_indent(WORKTREE_NEST_INDENT)
+            })
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
@@ -7222,6 +8138,7 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+            Some(ListEntry::WorktreeHeader { project_key, .. }) => Some(project_key.clone()),
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 (0..ix)
                     .rev()
@@ -7411,7 +8328,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {}
         }
     }
 

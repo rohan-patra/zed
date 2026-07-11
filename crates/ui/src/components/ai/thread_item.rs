@@ -52,6 +52,7 @@ pub struct ThreadItem {
     focused: bool,
     hovered: bool,
     rounded: bool,
+    leading_indent: Pixels,
     is_truncated: bool,
     added: Option<usize>,
     removed: Option<usize>,
@@ -87,6 +88,7 @@ impl ThreadItem {
             focused: false,
             hovered: false,
             rounded: false,
+            leading_indent: px(0.),
             is_truncated: true,
             added: None,
             removed: None,
@@ -216,6 +218,14 @@ impl ThreadItem {
 
     pub fn rounded(mut self, rounded: bool) -> Self {
         self.rounded = rounded;
+        self
+    }
+
+    /// Indents the row's content by the given amount while leaving the row (and
+    /// therefore its selection/hover background) full-width. Used to nest a row
+    /// beneath a section header.
+    pub fn leading_indent(mut self, indent: Pixels) -> Self {
+        self.leading_indent = indent;
         self
     }
 
@@ -433,7 +443,10 @@ impl RenderOnce for ThreadItem {
             .overflow_hidden()
             .w_full()
             .py_1()
-            .px_1p5()
+            .pr_1p5()
+            // Base horizontal padding matches `px_1p5`; extra left padding nests
+            // the content while the background below still fills the full width.
+            .pl(px(6.) + self.leading_indent)
             .when(self.selected, |s| s.bg(color.element_active))
             .border_1()
             .border_color(gpui::transparent_black())
