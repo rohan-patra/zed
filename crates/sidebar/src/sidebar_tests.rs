@@ -127,6 +127,34 @@ fn assert_project_header_has_threads(
 }
 
 #[track_caller]
+fn assert_worktree_header_has_threads(
+    sidebar: &Entity<Sidebar>,
+    worktree_label: &str,
+    expected_has_threads: bool,
+    cx: &mut gpui::VisualTestContext,
+) {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        let has_threads = sidebar.contents.entries.iter().find_map(|entry| {
+            if let ListEntry::WorktreeHeader {
+                label, has_threads, ..
+            } = entry
+                && label.as_ref() == worktree_label
+            {
+                Some(*has_threads)
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(
+            has_threads,
+            Some(expected_has_threads),
+            "expected worktree header `{worktree_label}` to have has_threads={expected_has_threads}, got {has_threads:?}"
+        );
+    });
+}
+
+#[track_caller]
 fn assert_remote_project_integration_sidebar_state(
     sidebar: &mut Sidebar,
     main_thread_id: &acp::SessionId,
@@ -14911,18 +14939,12 @@ fn test_split_leading_icon_char() {
     assert_eq!(positions, vec![0, 1]);
 }
 
-fn enable_group_threads_by_worktree(
-    sidebar: &Entity<Sidebar>,
-    cx: &mut gpui::VisualTestContext,
-) {
+fn enable_group_threads_by_worktree(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) {
     use gpui::UpdateGlobal as _;
     cx.update(|_, cx| {
         settings::SettingsStore::update_global(cx, |store, cx| {
             store
-                .set_user_settings(
-                    r#"{ "agent": { "group_threads_by_worktree": true } }"#,
-                    cx,
-                )
+                .set_user_settings(r#"{ "agent": { "group_threads_by_worktree": true } }"#, cx)
                 .unwrap();
         });
     });
@@ -14957,11 +14979,7 @@ async fn test_group_threads_by_worktree_setting_off_keeps_flat_list(cx: &mut Tes
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            "v [project]",
-            "  WT Thread {feature}",
-            "  Main Thread",
-        ],
+        vec!["v [project]", "  WT Thread {feature}", "  Main Thread",],
         "with the setting off, threads should be flat-listed under the project header"
     );
 }
@@ -15053,6 +15071,41 @@ async fn test_group_threads_by_worktree_shows_home_worktree_even_when_empty(
         ],
         "the home worktree subsection should be shown first even when it has no threads"
     );
+
+    // The empty main worktree carries the "No threads yet" empty state (its
+    // header reports no threads of its own), while the linked worktree that owns
+    // the thread does not.
+    assert_worktree_header_has_threads(&sidebar, "project", false, cx);
+    assert_worktree_header_has_threads(&sidebar, "feature", true, cx);
+}
+
+#[gpui::test]
+async fn test_group_threads_by_worktree_empty_project_shows_empty_state_per_worktree(
+    cx: &mut TestAppContext,
+) {
+    let (project, _fs) = init_test_project_with_git("/project", cx).await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    enable_group_threads_by_worktree(&sidebar, cx);
+
+    // With no threads anywhere, only the main worktree subsection is shown.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [project]", "  v [project]"],
+        "an empty project should still render its main worktree subsection"
+    );
+
+    // The project header no longer owns the empty state while grouping is on; it
+    // belongs to the (empty) main worktree header instead.
+    assert_project_header_has_threads(&sidebar, "project", false, cx);
+    assert_worktree_header_has_threads(&sidebar, "project", false, cx);
 }
 
 #[gpui::test]
