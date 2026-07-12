@@ -1,11 +1,13 @@
 mod application_menu;
 pub mod collab;
 mod onboarding_banner;
+mod open_in_app;
 mod plan_chip;
 mod title_bar_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
+use crate::open_in_app::{ExternalApp, LAST_USED_APP_KEY};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
@@ -47,7 +49,8 @@ use theme::ActiveTheme;
 use title_bar_settings::TitleBarSettings;
 use ui::{
     Avatar, ButtonLike, ContextMenu, ContextMenuEntry, IconWithIndicator, Indicator, PopoverMenu,
-    PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    PopoverMenuHandle, SplitButton, SplitButtonStyle, TintColor, Tooltip, prelude::*,
+    utils::platform_title_bar_height,
 };
 use update_version::UpdateVersion;
 use util::ResultExt;
@@ -194,6 +197,24 @@ fn set_window_layout(layout: WindowLayout, cx: &App) {
     drop(AgentSettings::set_layout(layout, fs, cx));
 }
 
+fn load_last_used_external_app(cx: &App) -> ExternalApp {
+    db::kvp::KeyValueStore::global(cx)
+        .read_kvp(LAST_USED_APP_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|id| ExternalApp::from_id(&id))
+        .unwrap_or(ExternalApp::DEFAULT)
+}
+
+fn persist_last_used_external_app(app: ExternalApp, cx: &mut App) {
+    let kvp = db::kvp::KeyValueStore::global(cx);
+    cx.spawn(async move |_| {
+        kvp.write_kvp(LAST_USED_APP_KEY.to_string(), app.id().to_string())
+            .await
+    })
+    .detach_and_log_err(cx);
+}
+
 pub struct TitleBar {
     platform_titlebar: Entity<PlatformTitleBar>,
     project: Entity<Project>,
@@ -206,6 +227,8 @@ pub struct TitleBar {
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
+    open_in_app_popover_handle: PopoverMenuHandle<ContextMenu>,
+    last_used_external_app: ExternalApp,
     _diagnostics_subscription: Option<gpui::Subscription>,
 }
 
@@ -323,6 +346,7 @@ impl Render for TitleBar {
                                         ))
                                     },
                                 )
+                                .children(self.render_open_in_app(cx))
                         })
                 })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -520,6 +544,8 @@ impl TitleBar {
             banner,
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
+            open_in_app_popover_handle: PopoverMenuHandle::default(),
+            last_used_external_app: load_last_used_external_app(cx),
             _diagnostics_subscription: None,
         };
 
@@ -1088,6 +1114,119 @@ impl TitleBar {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// Renders a split button that opens the active repository in an external
+    /// app (GitHub Desktop or Warp). The left face opens the most-recently-used
+    /// app; the chevron drops down the full list. Choosing an app from the list
+    /// opens it and makes it the new most-recently-used app.
+    fn render_open_in_app(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let worktree = self.effective_active_worktree(cx)?;
+        let repository = self.get_repository_for_worktree(&worktree, cx)?;
+        let target = Arc::new(self.open_target(&worktree, &repository, cx));
+
+        let last_used = self.last_used_external_app;
+        let last_used_available = last_used.url(&target).is_some();
+
+        let primary = {
+            let target = target.clone();
+            IconButton::new("open-in-app-primary", last_used.icon())
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .disabled(!last_used_available)
+                .tooltip(Tooltip::text(format!("Open in {}", last_used.label())))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_in_external_app(last_used, &target, cx);
+                }))
+        };
+
+        let this = cx.entity().downgrade();
+        let dropdown = PopoverMenu::new("open-in-app-menu")
+            .with_handle(self.open_in_app_popover_handle.clone())
+            .trigger(
+                ButtonLike::new_rounded_right("open-in-app-menu-trigger")
+                    .child(
+                        h_flex()
+                            .mx_neg_0p5()
+                            .h_full()
+                            .justify_center()
+                            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                    )
+                    .toggle_state(self.open_in_app_popover_handle.is_deployed()),
+            )
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let target = target.clone();
+                Some(ContextMenu::build(
+                    window,
+                    cx,
+                    move |mut menu, _window, _cx| {
+                        for app in ExternalApp::ALL {
+                            let this = this.clone();
+                            let target = target.clone();
+                            menu = menu.item(
+                                ContextMenuEntry::new(app.label())
+                                    .icon(app.icon())
+                                    .icon_color(Color::Muted)
+                                    .disabled(app.url(&target).is_none())
+                                    .handler(move |_window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.open_in_external_app(app, &target, cx);
+                                        })
+                                        .ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    },
+                ))
+            })
+            .anchor(gpui::Anchor::TopLeft);
+
+        Some(
+            SplitButton::new(primary, dropdown.into_any_element())
+                .style(SplitButtonStyle::Transparent)
+                .into_any_element(),
+        )
+    }
+
+    fn open_target(
+        &self,
+        worktree: &Entity<project::Worktree>,
+        repository: &Entity<project::git_store::Repository>,
+        cx: &App,
+    ) -> open_in_app::OpenTarget {
+        let repo = repository.read(cx);
+        let branch = repo.branch.as_ref().map(|branch| branch.name().to_string());
+        let repo_web_url = repo.default_remote_url().and_then(|remote_url| {
+            let registry = git::GitHostingProviderRegistry::try_global(cx)?;
+            let (provider, parsed) = git::parse_git_remote_url(registry, &remote_url)?;
+            let base = provider.base_url();
+            let base = base.as_str().trim_end_matches('/');
+            Some(format!("{base}/{}/{}", parsed.owner, parsed.repo))
+        });
+        open_in_app::OpenTarget {
+            abs_path: worktree.read(cx).abs_path(),
+            repo_web_url,
+            branch,
+        }
+    }
+
+    fn open_in_external_app(
+        &mut self,
+        app: ExternalApp,
+        target: &open_in_app::OpenTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(url) = app.url(target) else {
+            return;
+        };
+        cx.open_url(&url);
+        if self.last_used_external_app != app {
+            self.last_used_external_app = app;
+            persist_last_used_external_app(app, cx);
+            cx.notify();
+        }
     }
 
     fn window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
