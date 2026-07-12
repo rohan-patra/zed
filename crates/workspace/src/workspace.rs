@@ -171,6 +171,12 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 
+/// Whether dock/sidebar layout (panel visibility, active panel, zoom, and sizes) is
+/// shared globally across all projects rather than persisted per-workspace.
+pub(crate) fn global_dock_layout_enabled(cx: &App) -> bool {
+    agent_settings::AgentSettings::get_global(cx).group_threads_by_worktree
+}
+
 static ZED_WINDOW_SIZE: LazyLock<Option<Size<Pixels>>> = LazyLock::new(|| {
     env::var("ZED_WINDOW_SIZE")
         .ok()
@@ -1136,6 +1142,15 @@ pub struct PreviousWorkspaceState {
     pub open_file_paths: Vec<PathBuf>,
     pub active_file_path: Option<PathBuf>,
     pub focused_dock: Option<DockPosition>,
+}
+
+/// A snapshot of dock/sidebar layout (visibility, active panel, zoom, and panel sizes)
+/// that can be captured from one workspace and applied to another, independent of the
+/// content (open items) of either workspace.
+pub struct DockLayout {
+    structure: DockStructure,
+    // Indexed to match `Workspace::all_docks()` order: [left, bottom, right].
+    sizes: [Vec<(&'static str, dock::PanelSizeState)>; 3],
 }
 
 pub struct WorkspaceStore {
@@ -2254,6 +2269,43 @@ impl Workspace {
         }
     }
 
+    pub fn capture_dock_layout(&self, window: &Window, cx: &App) -> DockLayout {
+        let [left, bottom, right] = self.all_docks();
+        DockLayout {
+            structure: self.capture_dock_state(window, cx),
+            sizes: [
+                left.read(cx).panel_size_states(),
+                bottom.read(cx).panel_size_states(),
+                right.read(cx).panel_size_states(),
+            ],
+        }
+    }
+
+    pub fn apply_dock_layout(
+        &mut self,
+        layout: &DockLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `restore_state` only ever zooms panels in, never out. Clear any existing zoom on
+        // every panel first so a zoomed panel in the outgoing project (which may not be the
+        // dock's active panel) doesn't stick; `set_dock_structure` then re-zooms whichever
+        // dock the captured layout marks zoomed.
+        for dock in self.all_docks() {
+            dock.update(cx, |dock, cx| dock.zoom_out(window, cx));
+        }
+
+        self.set_dock_structure(layout.structure.clone(), window, cx);
+
+        for (dock, sizes) in self.all_docks().into_iter().zip(layout.sizes.iter()) {
+            dock.update(cx, |dock, cx| {
+                dock.set_panel_size_states(sizes, window, cx);
+            });
+        }
+
+        self.serialize_workspace(window, cx);
+    }
+
     /// Returns which dock currently has focus, or `None` if focus is in the
     /// center pane or elsewhere. Does NOT fall back to any global state.
     pub fn focused_dock_position(&self, window: &Window, cx: &App) -> Option<DockPosition> {
@@ -2358,24 +2410,24 @@ impl Workspace {
         size_state: dock::PanelSizeState,
         cx: &mut App,
     ) {
-        let Some(workspace_id) = self
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(self.session_id())
-        else {
-            return;
+        let global_dock_layout = global_dock_layout_enabled(cx);
+        let key = if global_dock_layout {
+            panel_key.to_string()
+        } else {
+            let Some(workspace_id) = self
+                .database_id()
+                .map(|id| i64::from(id).to_string())
+                .or(self.session_id())
+            else {
+                return;
+            };
+            format!("{workspace_id}:{panel_key}")
         };
 
         let kvp = db::kvp::KeyValueStore::global(cx);
-        let panel_key = panel_key.to_string();
         cx.background_spawn(async move {
             let scope = kvp.scoped(dock::PANEL_SIZE_STATE_KEY);
-            scope
-                .write(
-                    format!("{workspace_id}:{panel_key}"),
-                    serde_json::to_string(&size_state)?,
-                )
-                .await
+            scope.write(key, serde_json::to_string(&size_state)?).await
         })
         .detach_and_log_err(cx);
     }
@@ -7109,6 +7161,7 @@ impl Workspace {
 
                 let center_group = build_serialized_pane_group(&self.center.root, window, cx);
                 let docks = build_serialized_docks(self, window, cx);
+                let global_docks = global_dock_layout_enabled(cx).then(|| docks.clone());
                 let window_bounds = Some(SerializedWindowBounds(window.window_bounds()));
                 let identity_paths_hint = self.project_group_key(cx).path_list().clone();
 
@@ -7130,8 +7183,14 @@ impl Workspace {
                 };
 
                 let db = WorkspaceDb::global(cx);
+                let kvp = db::kvp::KeyValueStore::global(cx);
                 window.spawn(cx, async move |_| {
                     db.save_workspace(serialized_workspace).await;
+                    if let Some(global_docks) = global_docks {
+                        persistence::write_global_dock_layout(&kvp, global_docks)
+                            .await
+                            .log_err();
+                    }
                 })
             }
             WorkspaceLocation::DetachFromSession => {
@@ -7315,17 +7374,34 @@ impl Workspace {
                     }
                 }
 
-                let docks = serialized_workspace.docks;
+                let per_workspace_docks = serialized_workspace.docks;
+                let global_docks = if global_dock_layout_enabled(cx) {
+                    let kvp = db::kvp::KeyValueStore::global(cx);
+                    persistence::read_global_dock_layout(&kvp)
+                } else {
+                    None
+                };
 
-                for (dock, serialized_dock) in [
-                    (&mut workspace.right_dock, docks.right),
-                    (&mut workspace.left_dock, docks.left),
-                    (&mut workspace.bottom_dock, docks.bottom),
-                ]
-                .iter_mut()
-                {
+                for (dock, per_workspace_dock, global_dock) in [
+                    (
+                        &workspace.right_dock,
+                        per_workspace_docks.right,
+                        global_docks.as_ref().map(|docks| docks.right.clone()),
+                    ),
+                    (
+                        &workspace.left_dock,
+                        per_workspace_docks.left,
+                        global_docks.as_ref().map(|docks| docks.left.clone()),
+                    ),
+                    (
+                        &workspace.bottom_dock,
+                        per_workspace_docks.bottom,
+                        global_docks.as_ref().map(|docks| docks.bottom.clone()),
+                    ),
+                ] {
+                    let serialized_dock = global_dock.unwrap_or(per_workspace_dock);
                     dock.update(cx, |dock, cx| {
-                        dock.serialized_dock = Some(serialized_dock.clone());
+                        dock.serialized_dock = Some(serialized_dock);
                         dock.restore_state(window, cx);
                     });
                 }

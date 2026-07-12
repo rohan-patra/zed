@@ -1573,6 +1573,18 @@ impl MultiWorkspace {
             workspace.refresh_window_state(window, cx);
         });
 
+        // Carry the sidebar/dock layout from the outgoing workspace to the newly-active one so
+        // docks don't jump on switch. Uses live in-memory state to beat the async KVP write +
+        // serialize throttle.
+        if crate::global_dock_layout_enabled(cx) {
+            let layout = old_active_workspace
+                .read(cx)
+                .capture_dock_layout(window, cx);
+            self.active_workspace.update(cx, |workspace, cx| {
+                workspace.apply_dock_layout(&layout, window, cx);
+            });
+        }
+
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });
         self.serialize(cx);
         self.focus_active_workspace(window, cx);

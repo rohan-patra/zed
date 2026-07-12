@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::dock::test::TestPanel;
 use crate::item::test::TestItem;
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{TestAppContext, VisualTestContext, px};
 use project::DisableAiSettings;
 use serde_json::json;
 use settings::{Settings, SettingsStore};
@@ -1127,5 +1128,189 @@ async fn test_remove_project_group_with_remote_neighbor_does_not_create_local_wo
                 "remote neighbor should not have created a local workspace after remove_project_group"
             );
         }
+    });
+}
+
+#[gpui::test]
+async fn test_activate_transfers_dock_layout_when_group_threads_by_worktree_enabled(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    let workspace_a = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+
+    // Give workspace A a TestPanel in the right dock, open the dock, and give
+    // the panel a distinct stored size.
+    workspace_a.update_in(cx, |workspace, window, cx| {
+        let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+        workspace.add_panel(panel, window, cx);
+        workspace.toggle_dock(DockPosition::Right, window, cx);
+        workspace.set_panel_size_state::<TestPanel>(
+            PanelSizeState {
+                size: Some(px(250.)),
+                flex: None,
+            },
+            window,
+            cx,
+        );
+    });
+
+    // Adding workspace B activates it (setting is still off, so no layout
+    // transfer happens here).
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    // Give workspace B its own TestPanel with a distinct (closed) starting
+    // state, so it's meaningfully different from A's.
+    workspace_b.update_in(cx, |workspace, window, cx| {
+        let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+        workspace.add_panel(panel, window, cx);
+        workspace.set_panel_size_state::<TestPanel>(
+            PanelSizeState {
+                size: Some(px(100.)),
+                flex: None,
+            },
+            window,
+            cx,
+        );
+    });
+
+    workspace_b.read_with(cx, |workspace, cx| {
+        assert!(
+            !workspace.right_dock().read(cx).is_open(),
+            "B should start with its dock closed"
+        );
+        assert_eq!(
+            workspace.panel_size_state::<TestPanel>(cx),
+            Some(PanelSizeState {
+                size: Some(px(100.)),
+                flex: None
+            }),
+            "B should start with its own distinct panel size"
+        );
+    });
+
+    // Switch back to A, then turn on global dock layout sharing.
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(workspace_a.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        let mut settings = AgentSettings::get_global(cx).clone();
+        settings.group_threads_by_worktree = true;
+        AgentSettings::override_global(settings, cx);
+    });
+    cx.run_until_parked();
+
+    // Activating B should now copy A's live dock layout (open + size) onto B.
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(workspace_b.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace_b.read_with(cx, |workspace, cx| {
+        assert!(
+            workspace.right_dock().read(cx).is_open(),
+            "B's dock should mirror A's open dock after activation with sharing enabled"
+        );
+        assert_eq!(
+            workspace.panel_size_state::<TestPanel>(cx),
+            Some(PanelSizeState {
+                size: Some(px(250.)),
+                flex: None
+            }),
+            "B's panel size should mirror A's captured size after activation with sharing enabled"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_activate_does_not_transfer_dock_layout_when_group_threads_by_worktree_disabled(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    let workspace_a = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+
+    // Give workspace A a TestPanel in the right dock, open the dock, and give
+    // the panel a distinct stored size.
+    workspace_a.update_in(cx, |workspace, window, cx| {
+        let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+        workspace.add_panel(panel, window, cx);
+        workspace.toggle_dock(DockPosition::Right, window, cx);
+        workspace.set_panel_size_state::<TestPanel>(
+            PanelSizeState {
+                size: Some(px(250.)),
+                flex: None,
+            },
+            window,
+            cx,
+        );
+    });
+
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    // Give workspace B its own TestPanel with a distinct (closed) starting
+    // state.
+    workspace_b.update_in(cx, |workspace, window, cx| {
+        let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+        workspace.add_panel(panel, window, cx);
+        workspace.set_panel_size_state::<TestPanel>(
+            PanelSizeState {
+                size: Some(px(100.)),
+                flex: None,
+            },
+            window,
+            cx,
+        );
+    });
+
+    // Switch back to A and then to B again, with the setting left at its
+    // default (off). B's own layout must be preserved.
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(workspace_a.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(workspace_b.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace_b.read_with(cx, |workspace, cx| {
+        assert!(
+            !workspace.right_dock().read(cx).is_open(),
+            "B should keep its own closed dock when layout sharing is disabled"
+        );
+        assert_eq!(
+            workspace.panel_size_state::<TestPanel>(cx),
+            Some(PanelSizeState {
+                size: Some(px(100.)),
+                flex: None
+            }),
+            "B should keep its own panel size when layout sharing is disabled"
+        );
     });
 }

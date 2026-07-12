@@ -391,6 +391,27 @@ pub async fn write_default_dock_state(
     Ok(())
 }
 
+// Dock layout shared across all projects when `group_threads_by_worktree` is enabled. This
+// is kept separate from `DEFAULT_DOCK_STATE_KEY` (which seeds empty/project-less windows) so
+// that opening a project-less window can't clobber the shared project layout.
+const GLOBAL_DOCK_LAYOUT_KEY: &str = "global_dock_layout";
+
+pub fn read_global_dock_layout(kvp: &KeyValueStore) -> Option<DockStructure> {
+    let json_str = kvp.read_kvp(GLOBAL_DOCK_LAYOUT_KEY).log_err().flatten()?;
+
+    serde_json::from_str::<DockStructure>(&json_str).ok()
+}
+
+pub async fn write_global_dock_layout(
+    kvp: &KeyValueStore,
+    docks: DockStructure,
+) -> anyhow::Result<()> {
+    let json_str = serde_json::to_string(&docks)?;
+    kvp.write_kvp(GLOBAL_DOCK_LAYOUT_KEY.to_string(), json_str)
+        .await?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Bookmark {
     pub row: u32,

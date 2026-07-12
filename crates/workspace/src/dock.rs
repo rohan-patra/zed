@@ -921,6 +921,36 @@ impl Dock {
         }
     }
 
+    /// Snapshot every panel's current size state, keyed by panel_key, for transferring
+    /// the dock layout to another workspace on worktree switch.
+    pub fn panel_size_states(&self) -> Vec<(&'static str, PanelSizeState)> {
+        self.panel_entries
+            .iter()
+            .map(|entry| (entry.panel.panel_key(), entry.size_state))
+            .collect()
+    }
+
+    /// Apply captured panel sizes onto this dock's live entries. Mirrors the tail of
+    /// `resize_panel_entry`: updates `size_state` and fires `size_state_changed` so the
+    /// flexible/fixed layout recomputes. Does not persist; the caller serializes.
+    pub fn set_panel_size_states(
+        &mut self,
+        sizes: &[(&'static str, PanelSizeState)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for entry in &mut self.panel_entries {
+            if let Some((_, size_state)) = sizes
+                .iter()
+                .find(|(panel_key, _)| *panel_key == entry.panel.panel_key())
+            {
+                entry.size_state = *size_state;
+                entry.panel.size_state_changed(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn toggle_panel_flexible_size(
         &mut self,
         panel: &dyn PanelHandle,
@@ -1074,17 +1104,35 @@ impl Dock {
         panel_key: &'static str,
         cx: &App,
     ) -> Option<PanelSizeState> {
-        let workspace_id = workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())?;
         let kvp = KeyValueStore::global(cx);
         let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
-        scope
-            .read(&format!("{workspace_id}:{panel_key}"))
-            .log_err()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
+        let read_size_state = |key: &str| {
+            scope
+                .read(key)
+                .log_err()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
+        };
+
+        if crate::global_dock_layout_enabled(cx) {
+            // Global layouts are keyed by panel alone. Fall back to the legacy
+            // per-workspace key so existing users don't lose their saved widths
+            // when this setting is turned on.
+            if let Some(size_state) = read_size_state(panel_key) {
+                return Some(size_state);
+            }
+            let workspace_id = workspace
+                .database_id()
+                .map(|id| i64::from(id).to_string())
+                .or(workspace.session_id())?;
+            read_size_state(&format!("{workspace_id}:{panel_key}"))
+        } else {
+            let workspace_id = workspace
+                .database_id()
+                .map(|id| i64::from(id).to_string())
+                .or(workspace.session_id())?;
+            read_size_state(&format!("{workspace_id}:{panel_key}"))
+        }
     }
 }
 
