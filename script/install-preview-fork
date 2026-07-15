@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+# Build this fork of Zed as a release "Zed Preview" bundle and install it into
+# /Applications, overwriting the currently installed Zed Preview.
+#
+# This mirrors the core of script/bundle-mac but skips DMG creation and Apple
+# notarization, which aren't needed for a local install. The bundle is ad-hoc
+# codesigned so it will launch on Apple Silicon.
+#
+# Usage: script/install-preview-fork [-d]
+#   -d   Debug build (much faster to compile, slower at runtime)
+
+set -euo pipefail
+
+# Run from the repository root regardless of where the script is invoked from.
+cd "$(dirname "$0")/.."
+
+build_flag="--release"
+target_dir="release"
+while getopts 'dh' flag; do
+    case "${flag}" in
+        d) build_flag=""; target_dir="debug";;
+        h) echo "Usage: ${0##*/} [-d]"; exit 0;;
+        *) echo "Unknown option"; exit 1;;
+    esac
+done
+
+channel="preview"
+export ZED_RELEASE_CHANNEL="${channel}"
+export ZED_BUNDLE=true
+# Deal with versions of macOS that don't include libstdc++ headers.
+export CXXFLAGS="-stdlib=libc++"
+
+# Ensure the Zed fork of cargo-bundle is installed (same check as bundle-mac).
+cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
+if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+fi
+
+# cargo installs cargo-bundle into CARGO_HOME/bin; make sure it is on PATH so the
+# `cargo bundle` subcommand resolves even on a Homebrew Rust install.
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+
+# Determine the host target triple. Only rustup manages targets; a Homebrew Rust
+# toolchain has no rustup and already ships the native host target, so skip it.
+host_line=$(rustc --version --verbose | grep host)
+target_triple=${host_line#*: }
+if command -v rustup >/dev/null 2>&1; then
+    rustup target add "$target_triple"
+fi
+
+# Bake licenses into the binaries, as the release build expects them.
+script/generate-licenses
+
+echo "Compiling zed binaries ($target_dir, channel=$channel)"
+cargo build ${build_flag} --package zed --package cli --target "$target_triple"
+# Build remote_server separately to avoid cross-crate feature unification.
+cargo build ${build_flag} --package remote_server --target "$target_triple"
+
+echo "Creating application bundle"
+pushd crates/zed >/dev/null
+cp Cargo.toml Cargo.toml.backup
+# Restore the original Cargo.toml on any exit so the working tree stays clean.
+trap 'mv crates/zed/Cargo.toml.backup crates/zed/Cargo.toml 2>/dev/null || true' EXIT
+sed -i.backup "s/package.metadata.bundle-${channel}/package.metadata.bundle/" Cargo.toml
+app_path=$(cargo bundle ${build_flag} --target "$target_triple" --select-workspace-root | xargs)
+mv Cargo.toml.backup Cargo.toml
+rm -f Cargo.toml.backup
+trap - EXIT
+popd >/dev/null
+echo "Bundled ${app_path}"
+
+# DocumentTypes.plist references a Document.icns; copy the placeholder if present.
+document_icon_source="crates/zed/resources/Document.icns"
+if [[ -f "${document_icon_source}" ]]; then
+    mkdir -p "${app_path}/Contents/Resources"
+    cp "${document_icon_source}" "${app_path}/Contents/Resources/Document.icns"
+fi
+
+# Codesign so the app launches (required on Apple Silicon). Universal links stay
+# stripped because they need Zed Industries' provisioning profile, which no cert
+# of ours can supply. Signing with a stable identity (rather than ad-hoc "-")
+# keeps the designated requirement constant across rebuilds, so TCC privacy
+# grants (Camera, Screen Recording, Accessibility, ...) persist between installs.
+#
+# Override with ZED_SIGN_IDENTITY; otherwise pick the first valid codesigning
+# identity, falling back to ad-hoc if none is available.
+sign_identity="${ZED_SIGN_IDENTITY:-}"
+if [[ -z "$sign_identity" ]]; then
+    sign_identity=$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk '/^ *[0-9]+\)/ && !/CSSMERR/ {print $2; exit}')
+fi
+if [[ -z "$sign_identity" ]]; then
+    echo "No codesigning identity found; signing ad-hoc (TCC grants will reset each rebuild)."
+    sign_identity="-"
+else
+    echo "Signing with identity ${sign_identity}"
+fi
+
+sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements \
+    > "${app_path}/Contents/Resources/zed.entitlements"
+codesign --force --deep --entitlements "${app_path}/Contents/Resources/zed.entitlements" --sign "$sign_identity" "${app_path}" -v
+
+bundle_name=$(basename "$app_path")
+echo "Installing to /Applications/$bundle_name"
+rm -rf "/Applications/$bundle_name"
+mv "$app_path" "/Applications/$bundle_name"
+echo "Installed: /Applications/$bundle_name"
