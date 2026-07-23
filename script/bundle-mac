@@ -227,10 +227,18 @@ function sign_app_binaries() {
     if [ "$local_install" = true ]; then
         rm -rf "/Applications/$bundle_name"
         mv "$app_path" "/Applications/$bundle_name"
-        mkdir -p "$HOME/.local/bin"
-        ln -sf "/Applications/$bundle_name/Contents/MacOS/cli" "$HOME/.local/bin/zed"
+        cli_path="/Applications/$bundle_name/Contents/MacOS/cli"
+        if [ -w "/opt/homebrew/bin" ]; then
+            cli_link_path="/opt/homebrew/bin/zed"
+        elif [ -w "/usr/local/bin" ]; then
+            cli_link_path="/usr/local/bin/zed"
+        else
+            mkdir -p "$HOME/.local/bin"
+            cli_link_path="$HOME/.local/bin/zed"
+        fi
+        ln -sf "$cli_path" "$cli_link_path"
         echo "Installed application bundle: /Applications/$bundle_name"
-        echo "Installed CLI symlink: $HOME/.local/bin/zed"
+        echo "Installed CLI symlink: $cli_link_path"
         if [ "$open_result" = true ]; then
             echo "Opening /Applications/$bundle_name"
             open "/Applications/$bundle_name"
