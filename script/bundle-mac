@@ -227,7 +227,10 @@ function sign_app_binaries() {
     if [ "$local_install" = true ]; then
         rm -rf "/Applications/$bundle_name"
         mv "$app_path" "/Applications/$bundle_name"
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "/Applications/$bundle_name/Contents/MacOS/cli" "$HOME/.local/bin/zed"
         echo "Installed application bundle: /Applications/$bundle_name"
+        echo "Installed CLI symlink: $HOME/.local/bin/zed"
         if [ "$open_result" = true ]; then
             echo "Opening /Applications/$bundle_name"
             open "/Applications/$bundle_name"
@@ -236,12 +239,12 @@ function sign_app_binaries() {
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
+    if [ "$local_install" = true ]; then
+        return
+    elif [[ "$target_dir" = "debug" ]]; then
         echo "Debug build detected - skipping DMG creation and signing"
-        if [ "$local_install" = false ]; then
-            echo "Created application bundle:"
-            echo "$app_path"
-        fi
+        echo "Created application bundle:"
+        echo "$app_path"
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
