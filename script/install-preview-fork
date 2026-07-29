@@ -105,4 +105,11 @@ bundle_name=$(basename "$app_path")
 echo "Installing to /Applications/$bundle_name"
 rm -rf "/Applications/$bundle_name"
 mv "$app_path" "/Applications/$bundle_name"
+
+cli_path="/Applications/$bundle_name/Contents/MacOS/cli"
+cli_link_path="$HOME/.local/bin/zed"
+mkdir -p "$(dirname "$cli_link_path")"
+ln -sf "$cli_path" "$cli_link_path"
+
 echo "Installed: /Applications/$bundle_name"
+echo "Installed CLI: $cli_link_path -> $cli_path"
