@@ -70,6 +70,8 @@ trap - EXIT
 popd >/dev/null
 echo "Bundled ${app_path}"
 
+cp "target/$target_triple/$target_dir/cli" "${app_path}/Contents/MacOS/cli"
+
 # DocumentTypes.plist references a Document.icns; copy the placeholder if present.
 document_icon_source="crates/zed/resources/Document.icns"
 if [[ -f "${document_icon_source}" ]]; then
