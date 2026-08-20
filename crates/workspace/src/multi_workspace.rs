@@ -1421,7 +1421,7 @@ impl MultiWorkspace {
             let layout = old_active_workspace
                 .read(cx)
                 .capture_dock_layout(window, cx);
-            self.active_workspace.update(cx, |workspace, cx| {
+            workspace.update(cx, |workspace, cx| {
                 workspace.apply_dock_layout(&layout, window, cx);
             });
         }
