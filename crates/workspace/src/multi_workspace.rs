@@ -1518,7 +1518,8 @@ impl MultiWorkspace {
                 .project_groups
                 .iter()
                 .map(|group| {
-                    let collapsed: Vec<PathList> = group.collapsed_worktrees.iter().cloned().collect();
+                    let collapsed: Vec<PathList> =
+                        group.collapsed_worktrees.iter().cloned().collect();
                     crate::persistence::model::SerializedProjectGroup::from_group(
                         &group.key,
                         group.expanded,
