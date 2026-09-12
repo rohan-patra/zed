@@ -152,6 +152,11 @@ pub trait Fs: Send + Sync {
         Ok(())
     }
 
+    /// Records raw local watcher notifications until the returned recording is dropped.
+    fn record_watcher_diagnostics(&self) -> Option<fs_watcher::WatchRecording> {
+        None
+    }
+
     /// Whether `path` exists, without following a final symlink. Synchronous
     /// because watches are registered synchronously by the worktree scanner.
     fn path_exists(&self, path: &Path) -> bool;
@@ -446,7 +451,8 @@ pub struct RealFs {
     this: std::sync::Weak<Self>,
     bundled_git_binary_path: Option<PathBuf>,
     executor: BackgroundExecutor,
-    global_watcher: Arc<fs_watcher::GlobalWatcher>,
+    native_watcher: Arc<fs_watcher::OsWatcher>,
+    poll_watcher: Arc<fs_watcher::OsWatcher>,
     next_job_id: Arc<AtomicUsize>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Arc<Mutex<SlotMap<TrashId, TrashedEntry>>>,
@@ -556,7 +562,14 @@ impl RealFs {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             bundled_git_binary_path: git_binary_path,
-            global_watcher: fs_watcher::GlobalWatcher::new(executor.clone()),
+            native_watcher: fs_watcher::OsWatcher::new(
+                fs_watcher::OsWatcherKind::Native,
+                executor.clone(),
+            ),
+            poll_watcher: fs_watcher::OsWatcher::new(
+                fs_watcher::OsWatcherKind::Poll,
+                executor.clone(),
+            ),
             executor,
             next_job_id: Arc::new(AtomicUsize::new(0)),
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -1164,7 +1177,14 @@ impl Fs for RealFs {
     }
 
     fn start_native_watcher(&self) -> Result<()> {
-        self.global_watcher.ensure_native_watcher()
+        self.native_watcher.ensure_backend()
+    }
+
+    fn record_watcher_diagnostics(&self) -> Option<fs_watcher::WatchRecording> {
+        Some(fs_watcher::WatchRecording::new([
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
+        ]))
     }
 
     fn path_exists(&self, path: &Path) -> bool {
@@ -1193,7 +1213,8 @@ impl Fs for RealFs {
             .expect("RealFs is only constructed inside an Arc");
         fs_watcher::watch(
             this,
-            self.global_watcher.clone(),
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
             self.executor.clone(),
             path,
             latency,
@@ -1419,7 +1440,8 @@ pub struct FakeFs {
     // Use an unfair lock to ensure tests are deterministic.
     state: Arc<Mutex<FakeFsState>>,
     executor: gpui::BackgroundExecutor,
-    global_watcher: Arc<fs_watcher::GlobalWatcher>,
+    native_watcher: Arc<fs_watcher::OsWatcher>,
+    poll_watcher: Arc<fs_watcher::OsWatcher>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1443,7 +1465,7 @@ struct FakeFsState {
 
 /// The kernel's side of file watching, as far as the real watcher code above
 /// notify can tell: the paths the backend has registered and the callback that
-/// delivers events for them into the `GlobalWatcher`.
+/// delivers events for them into the native `OsWatcher`.
 #[cfg(feature = "test-support")]
 #[derive(Default)]
 struct FakeWatches {
@@ -1810,19 +1832,23 @@ impl FakeFs {
             remove_dir_errors: Default::default(),
             case_sensitive: true,
         }));
-        let global_watcher = fs_watcher::GlobalWatcher::with_native_backend(
+        let native_watcher = fs_watcher::OsWatcher::with_backend(
+            fs_watcher::OsWatcherKind::Native,
             executor.clone(),
             Some(Box::new(FakeWatchBackend {
                 state: state.clone(),
             })),
         );
-        state.lock().watches.event_sink = Some(Box::new(global_watcher.native_event_sink()));
+        state.lock().watches.event_sink = Some(Box::new(native_watcher.event_sink()));
+        let poll_watcher =
+            fs_watcher::OsWatcher::new(fs_watcher::OsWatcherKind::Poll, executor.clone());
 
         let this = Arc::new_cyclic(|this| Self {
             this: this.clone(),
             executor: executor.clone(),
             state,
-            global_watcher,
+            native_watcher,
+            poll_watcher,
         });
 
         executor.spawn({
@@ -3331,7 +3357,8 @@ impl Fs for FakeFs {
         // own, so a real debounce would stall every test until `advance_clock`.
         let (events, watcher) = fs_watcher::watch(
             self.this.upgrade().unwrap(),
-            self.global_watcher.clone(),
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
             self.executor.clone(),
             path,
             Duration::ZERO,
@@ -3380,6 +3407,13 @@ impl Fs for FakeFs {
 
     async fn git_config(&self, _abs_work_directory: &Path, _args: Vec<String>) -> Result<String> {
         anyhow::bail!("Git config is not supported in fake Fs")
+    }
+
+    fn record_watcher_diagnostics(&self) -> Option<fs_watcher::WatchRecording> {
+        Some(fs_watcher::WatchRecording::new([
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
+        ]))
     }
 
     fn path_exists(&self, path: &Path) -> bool {
