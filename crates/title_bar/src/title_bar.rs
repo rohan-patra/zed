@@ -1131,7 +1131,8 @@ impl TitleBar {
     /// opens it and makes it the new most-recently-used app.
     fn render_open_in_app(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let worktree = self.effective_active_worktree(cx)?;
-        let repository = self.get_repository_for_worktree(&worktree, cx)?;
+        let path_style = worktree.read(cx).path_style();
+        let repository = self.get_repository_for_worktree(&worktree, path_style, cx)?;
         let target = Arc::new(self.open_target(&worktree, &repository, cx));
 
         let last_used = self.last_used_external_app;
